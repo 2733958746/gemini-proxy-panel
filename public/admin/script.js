@@ -92,7 +92,8 @@ function hideError(container = errorMessageDiv) {
     }
 
     // Generic API fetch function (using cookie auth now)
-    async function apiFetch(endpoint, options = {}) {
+    // 新增 suppressGlobalError 参数，允许调用方控制是否全局报错
+    async function apiFetch(endpoint, options = {}, suppressGlobalError = false) {
         showLoading();
         hideError();
         hideError(categoryQuotasErrorDiv);
@@ -176,6 +177,9 @@ function hideError(container = errorMessageDiv) {
             return data;
         } catch (error) {
             console.error('API Fetch Error:', error);
+            if (suppressGlobalError) {
+                throw error;
+            }
             if (endpoint === '/category-quotas') {
                 showError(error.message || 'An unknown error occurred.', categoryQuotasErrorDiv, categoryQuotasErrorDiv);
             } else {
@@ -211,7 +215,7 @@ function hideError(container = errorMessageDiv) {
     }
 
 
-    async function renderGeminiKeys(keys) {
+async function renderGeminiKeys(keys) {
         geminiKeysListDiv.innerHTML = ''; // Clear previous list
         if (!keys || keys.length === 0) {
             geminiKeysListDiv.innerHTML = '<p class="text-gray-500">No Gemini keys configured.</p>';
@@ -223,15 +227,80 @@ function hideError(container = errorMessageDiv) {
             console.warn("Models cache is empty during renderGeminiKeys. Load may be incomplete.");
         }
 
-        // Create a card container using a grid layout
+        // Calculate statistics
+        const totalKeys = keys.length;
+        const totalUsage = keys.reduce((sum, key) => sum + (parseInt(key.usage) || 0), 0);
+        
+        // Create main container
+        const keysContainer = document.createElement('div');
+        keysContainer.className = 'keys-container';
+        geminiKeysListDiv.appendChild(keysContainer);
+        
+        // Create statistics bar that's always visible
+        const statsBar = document.createElement('div');
+        // Removed justify-between, added relative for positioning context and select-none to prevent text selection
+        statsBar.className = 'stats-bar relative flex items-center justify-center p-3 rounded-md mb-4 cursor-pointer transition-colors select-none';
+        statsBar.innerHTML = `
+            <div class="stats-info flex items-center space-x-8"> 
+                 <div class="flex items-baseline">
+                     <span class="text-sm font-bold text-gray-600 dark:text-gray-400 mr-1">API Keys:</span>
+                     <span class="text-lg font-semibold text-blue-700 dark:text-blue-400">${totalKeys}</span>
+                 </div>
+                 <div class="flex items-baseline">
+                     <span class="text-sm font-bold text-gray-600 dark:text-gray-400 mr-1">24hr Usage:</span>
+                     <span class="text-lg font-semibold text-green-700 dark:text-green-400">${totalUsage}</span>
+                 </div>
+            </div>
+            <div class="toggle-icon absolute right-3 top-1/2 transform -translate-y-1/2">
+                <svg class="expand-icon w-5 h-5 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path>
+                </svg>
+        <svg class="collapse-icon w-5 h-5 hidden text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 14l-7-7-7 7"></path>
+        </svg>
+            </div>
+        `;
+        keysContainer.appendChild(statsBar);
+        
+        // Create collapsible grid container
         const keysGrid = document.createElement('div');
-        keysGrid.className = 'grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4';
-        geminiKeysListDiv.appendChild(keysGrid);
+        keysGrid.className = 'keys-grid grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 transition-all duration-300 max-h-[60vh] overflow-y-auto';
+        
+        // Set initial expanded/collapsed state based on key count
+        const isInitiallyExpanded = totalKeys <= 6;
+        if (!isInitiallyExpanded) {
+            keysGrid.classList.add('hidden');
+        }
+        
+        // Update icon display
+        const expandIcon = statsBar.querySelector('.expand-icon'); // Left arrow - collapsed state
+        const collapseIcon = statsBar.querySelector('.collapse-icon'); // Down arrow - expanded state
+
+        if (isInitiallyExpanded) {
+            // Content expanded state (visible): show down arrow
+            expandIcon.classList.add('hidden');
+            collapseIcon.classList.remove('hidden');
+        } else {
+            // Content collapsed state (hidden): show left arrow
+            expandIcon.classList.remove('hidden');
+            collapseIcon.classList.add('hidden');
+        }
+        
+        keysContainer.appendChild(keysGrid);
+
+        // Add click event listener to toggle the grid visibility
+        statsBar.addEventListener('click', (e) => {
+            // 防止文本选择
+            e.preventDefault();
+            keysGrid.classList.toggle('hidden');
+            expandIcon.classList.toggle('hidden');
+            collapseIcon.classList.toggle('hidden');
+        });
 
         keys.forEach(key => {
             // Create a simplified card for each key
             const cardItem = document.createElement('div');
-            cardItem.className = 'card-item p-4 border rounded-md bg-white shadow-sm hover:shadow-md transition-shadow cursor-pointer';
+            cardItem.className = 'card-item p-4 border rounded-md bg-white shadow-sm hover:shadow-md transition-shadow cursor-pointer select-none';
             cardItem.dataset.keyId = key.id;
 
             // Show warning icon
@@ -502,7 +571,9 @@ function hideError(container = errorMessageDiv) {
 
 
             // Add click event to the card to display the detailed information modal
-            cardItem.addEventListener('click', () => {
+            cardItem.addEventListener('click', (e) => {
+                // 防止文本选择
+                e.preventDefault();
                 detailModal.classList.remove('hidden');
             });
 
@@ -542,7 +613,7 @@ function hideError(container = errorMessageDiv) {
             });
         });
 
-        // Add run test button click event (no changes needed here)
+        // Add run test button click event（修正：测试报错只显示在测试区域）
         document.querySelectorAll('.run-test-btn').forEach(btn => {
             btn.addEventListener('click', async (e) => {
                 const testSection = e.target.closest('.test-model-section');
@@ -560,26 +631,33 @@ function hideError(container = errorMessageDiv) {
                 resultDiv.classList.remove('hidden');
                 resultPre.textContent = 'Testing...';
 
-                // Send test request
-                const result = await apiFetch('/test-gemini-key', {
-                    method: 'POST',
-                    body: JSON.stringify({ keyId, modelId })
-                });
+                // Send test request，捕获异常并只显示在测试区域
+                let result = null;
+                try {
+                    result = await apiFetch('/test-gemini-key', {
+                        method: 'POST',
+                        body: JSON.stringify({ keyId, modelId })
+                    }, true); // suppressGlobalError = true
 
-                if (result) {
-                    const formattedContent = typeof result.content === 'object'
-                        ? JSON.stringify(result.content, null, 2)
-                        : result.content;
+                    if (result) {
+                        const formattedContent = typeof result.content === 'object'
+                            ? JSON.stringify(result.content, null, 2)
+                            : result.content;
 
-                    if (result.success) {
-                        resultPre.textContent = `Test Passed!\nStatus: ${result.status}\n\nResponse:\n${formattedContent}`;
-                        resultPre.className = 'text-xs bg-green-50 text-green-800 p-2 rounded overflow-x-auto';
+                        if (result.success) {
+                            resultPre.textContent = `Test Passed!\nStatus: ${result.status}\n\nResponse:\n${formattedContent}`;
+                            resultPre.className = 'text-xs bg-green-50 text-green-800 p-2 rounded overflow-x-auto';
+                        } else {
+                            resultPre.textContent = `Test Failed.\nStatus: ${result.status}\n\nResponse:\n${formattedContent}`;
+                            resultPre.className = 'text-xs bg-red-50 text-red-800 p-2 rounded overflow-x-auto';
+                        }
                     } else {
-                        resultPre.textContent = `Test Failed.\nStatus: ${result.status}\n\nResponse:\n${formattedContent}`;
+                        resultPre.textContent = 'Test failed: No response from server';
                         resultPre.className = 'text-xs bg-red-50 text-red-800 p-2 rounded overflow-x-auto';
                     }
-                } else {
-                    resultPre.textContent = 'Test failed: No response from server';
+                } catch (error) {
+                    // 只在测试区域显示错误
+                    resultPre.textContent = `Test failed: ${error.message || 'Unknown error'}`;
                     resultPre.className = 'text-xs bg-red-50 text-red-800 p-2 rounded overflow-x-auto';
                 }
             });
@@ -978,11 +1056,13 @@ function hideError(container = errorMessageDiv) {
         
         // 逐个处理每个API Key
         for (const key of validKeys) {
-            const keyData = {
-                key: key,
-                name: data.name ? data.name.trim() : ''
-            };
-            
+            let keyData = { key: key }; // Base data
+
+            // Only include name if adding a single key
+            if (validKeys.length === 1 && data.name) {
+                keyData.name = data.name.trim();
+            }
+
             try {
                 const result = await apiFetch('/gemini-keys', {
                     method: 'POST',

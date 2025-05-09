@@ -1,5 +1,8 @@
-// Load environment variables from .env file
+// Load environment variables from .env file FIRST
 require('dotenv').config();
+
+// Manually load VERTEX from .env before doing anything else that might need it
+const vertexService = require('./services/vertexProxyService'); // Imports and triggers manual load
 
 const express = require('express');
 const path = require('path');
@@ -13,6 +16,10 @@ const { db } = require('./db');
 const authRoutes = require('./routes/auth');
 const adminApiRoutes = require('./routes/adminApi');
 const apiV1Routes = require('./routes/apiV1');
+
+// Import services and utils (ensure proxyPool is imported to trigger its initialization)
+require('./services/geminiProxyService'); // Still need to import this for other initializations if any
+const proxyPool = require('./utils/proxyPool');
 
 // Import middleware
 const requireAdminAuth = require('./middleware/adminAuth');
@@ -87,6 +94,29 @@ app.use((err, req, res, next) => {
 // --- Start Server ---
 app.listen(port, '0.0.0.0', () => {
     console.log(`Gemini Proxy Panel (Node.js version) listening on port ${port} (all interfaces)`);
+    
+    // Log Proxy Pool Status
+    const proxyStatus = proxyPool.getProxyPoolStatus(); // Get status from proxyPool module
+    if (proxyStatus.enabled) {
+        console.log(`Proxy Pool: Enabled (Loaded ${proxyStatus.count} SOCKS5 proxies)`);
+    } else if (proxyStatus.count > 0 && !proxyStatus.agentLoaded) {
+        console.log(`Proxy Pool: Configured (${proxyStatus.count} proxies) but DISABLED (missing 'socks-proxy-agent' dependency)`);
+    } else {
+        console.log(`Proxy Pool: Disabled (PROXY environment variable not set or contains no valid SOCKS5 proxies)`);
+    }
+    
+    // Log Vertex AI Status using the check function
+    if (vertexService.isVertexEnabled()) {
+        // Check if we're using Express Mode
+        if (process.env.EXPRESS_API_KEY) {
+            console.log(`Vertex AI: Enabled with Express Mode (API Key authentication, additional [v] prefixed models available)`);
+        } else {
+            console.log(`Vertex AI: Enabled (Service Account credentials, additional [v] prefixed models available)`);
+        }
+    } else {
+        console.log(`Vertex AI: Disabled (VERTEX variable and EXPRESS_API_KEY not found or invalid in .env file)`);
+    }
+    
     // Check if running in Hugging Face Space
     if (process.env.HUGGING_FACE === '1' && process.env.SPACE_HOST) {
         const adminUrl = `https://${process.env.SPACE_HOST}/admin`;

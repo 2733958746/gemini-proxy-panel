@@ -1,3 +1,5 @@
+import { kvSyncManager } from './kvSyncManager';
+
 export interface Env {
 	// KV Namespaces
 	GEMINI_KEYS_KV: KVNamespace;
@@ -11,6 +13,8 @@ export interface Env {
 	SESSION_SECRET_KEY?: string;
 	KEEPALIVE_ENABLED?: string; // Added for keepalive feature
 }
+
+const GEMINI_BASE_URL = process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com';
 
 // --- Session Constants ---
 const SESSION_COOKIE_NAME = '__session';
@@ -69,9 +73,43 @@ function getTodayInLA(): string {
 
 
 export default {
+	// 处理定时任务，每30分钟执行一次数据同步
+	async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+		console.log('[Scheduled] 执行定时KV同步任务');
+		
+		// 初始化KV命名空间
+		const geminiKV = env.GEMINI_KEYS_KV;
+		const workerConfigKV = env.WORKER_CONFIG_KV;
+		
+		// 添加绑定名称以帮助命名空间识别
+		(geminiKV as any).__BINDING_NAME = "GEMINI_KEYS_KV";
+		(workerConfigKV as any).__BINDING_NAME = "WORKER_CONFIG_KV";
+		
+		// 注册命名空间
+		kvSyncManager.registerNamespace(geminiKV);
+		kvSyncManager.registerNamespace(workerConfigKV);
+		
+		// 强制执行同步，确保所有内存中的数据被写入KV
+		await kvSyncManager.forceSyncAll();
+		
+		console.log('[Scheduled] 定时KV同步任务完成');
+	},
+
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 		const pathname = url.pathname;
+
+		// 初始化KV命名空间 - 使用固定的命名空间名称而不是随机ID
+		const geminiKV = env.GEMINI_KEYS_KV;
+		const workerConfigKV = env.WORKER_CONFIG_KV;
+		
+		// 添加绑定名称以帮助命名空间识别
+		(geminiKV as any).__BINDING_NAME = "GEMINI_KEYS_KV";
+		(workerConfigKV as any).__BINDING_NAME = "WORKER_CONFIG_KV";
+		
+		// 注册命名空间
+		kvSyncManager.registerNamespace(geminiKV);
+		kvSyncManager.registerNamespace(workerConfigKV);
 
 		try {
 			// API endpoint for OpenAI compatibility
@@ -660,15 +698,19 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 	let useKeepAlive = false; // Initialize keepalive flag
 
 	try {
-		// Fetch models config and safety settings once before the loop
-		[modelsConfig, safetySettingsJson] = await Promise.all([
-			env.WORKER_CONFIG_KV.get(KV_KEY_MODELS, "json") as Promise<Record<string, ModelConfig> | null>,
-			workerApiKey ? env.WORKER_CONFIG_KV.get(KV_KEY_WORKER_KEYS_SAFETY) : Promise.resolve(null) // Fetches string or null
-		]);
+	// Fetch models config and safety settings once before the loop
+	[modelsConfig, safetySettingsJson] = await Promise.all([
+		kvSyncManager.getKV(env.WORKER_CONFIG_KV, KV_KEY_MODELS, "json") as Promise<Record<string, ModelConfig> | null>,
+		workerApiKey ? kvSyncManager.getKV(env.WORKER_CONFIG_KV, KV_KEY_WORKER_KEYS_SAFETY) : Promise.resolve(null) // Fetches string or null
+	]);
 
-		modelInfo = modelsConfig?.[requestedModelId];
+		// 统一用actualModelId查找模型配置
+		const isSearchModel = requestedModelId.endsWith('-search');
+		const actualModelId = isSearchModel ? requestedModelId.replace('-search', '') : requestedModelId;
+
+		modelInfo = modelsConfig?.[actualModelId];
 		if (!modelInfo) {
-			return new Response(JSON.stringify({ error: `Model '${requestedModelId}' is not configured.` }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
+			return new Response(JSON.stringify({ error: `Model '${actualModelId}' is not configured.` }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
 		}
 		modelCategory = modelInfo.category;
 
@@ -806,8 +848,8 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 				const apiAction = actualStreamMode ? 'streamGenerateContent' : 'generateContent';
 				const querySeparator = actualStreamMode ? '?alt=sse&' : '?'; // Use alt=sse only if actually streaming to Gemini
 
-				// For -search models, use the original model name
-				const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${actualModelId}:${apiAction}${querySeparator}key=${selectedKey.key}`;
+				// Always use actualModelId (without -search suffix) for the API request
+				const geminiUrl = `${GEMINI_BASE_URL}/v1beta/models/${actualModelId}:${apiAction}${querySeparator}key=${selectedKey.key}`;
 
 				const geminiRequestHeaders = new Headers();
 				geminiRequestHeaders.set('Content-Type', 'application/json');
@@ -827,6 +869,7 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 				});
 
 				// 5. Handle Gemini Response Status and Errors
+				let forceNewKey = false; // Flag to force getting a new key on retry for empty responses
 				if (!geminiResponse.ok) {
 					const errorBodyText = await geminiResponse.text(); // Read error body once
 					console.error(`Attempt ${attempt}: Gemini API error: ${geminiResponse.status} ${geminiResponse.statusText}`, errorBodyText);
@@ -878,10 +921,26 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 						...corsHeaders()
 					});
 
+					// Always use the original requestedModelId (with -search suffix if present) for responses to client
+					const responseModelId = requestedModelId;
+
 					// --- KEEPALIVE MODE ---
 					if (useKeepAlive) {
 						const geminiJson = await geminiResponse.json(); // Get full response (since actualStreamMode was false)
 						console.log("Processing successful response in KEEPALIVE mode.");
+						
+						// Check if it's an empty response (finishReason is OTHER and no content)
+						const isEmptyResponse = geminiJson.candidates && 
+											  geminiJson.candidates[0] && 
+											  geminiJson.candidates[0].finishReason === "OTHER" && 
+											  (!geminiJson.candidates[0].content || 
+											   !geminiJson.candidates[0].content.parts || 
+											   geminiJson.candidates[0].content.parts.length === 0);
+						
+						if (isEmptyResponse && attempt < MAX_RETRIES) {
+							console.log(`Detected empty response (finishReason: OTHER), attempting retry #${attempt + 1} with a new key...`);
+							continue; // Continue to the next attempt
+						}
 
 						const keepAliveStream = new ReadableStream({
 							async start(controller) {
@@ -909,8 +968,8 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 									console.log("Initial keepalive chunk sent.");
 									keepAliveTimer = setTimeout(sendKeepAlive, 5000);
 
-									// Transform the complete Gemini response
-									const openaiResponseObject = transformGeminiResponseToOpenAIObject(geminiJson, requestedModelId!);
+									// Transform the complete Gemini response - use original model ID with search suffix if present
+									const openaiResponseObject = transformGeminiResponseToOpenAIObject(geminiJson, responseModelId);
 
 									// Extract necessary parts
 									const finalMessage = openaiResponseObject?.choices?.[0]?.message;
@@ -1004,7 +1063,7 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 												continue;
 											}
 											const jsonData = JSON.parse(trimmedData);
-											const openaiChunkStr = transformGeminiStreamChunk(jsonData, requestedModelId!);
+											const openaiChunkStr = transformGeminiStreamChunk(jsonData, responseModelId);
 											if (openaiChunkStr) controller.enqueue(new TextEncoder().encode(openaiChunkStr));
 										} catch (e) {
 											console.error("Error parsing/transforming stream line:", line, e);
@@ -1023,7 +1082,7 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 										const trimmedData = buffer.substring(6).trim();
 										if (trimmedData.length > 0 && trimmedData !== '[DONE]') {
 											const jsonData = JSON.parse(trimmedData);
-											const openaiChunkStr = transformGeminiStreamChunk(jsonData, requestedModelId!);
+											const openaiChunkStr = transformGeminiStreamChunk(jsonData, responseModelId);
 											if (openaiChunkStr) controller.enqueue(new TextEncoder().encode(openaiChunkStr));
 										}
 									} catch (e) {
@@ -1045,8 +1104,22 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 					else if (!stream) {
 						console.log("Processing successful response in NON-STREAMING mode.");
 						const geminiJson = await geminiResponse.json();
+						
+						// Check if it's an empty response (finishReason is OTHER and no content)
+						const isEmptyResponse = geminiJson.candidates && 
+											  geminiJson.candidates[0] && 
+											  geminiJson.candidates[0].finishReason === "OTHER" && 
+											  (!geminiJson.candidates[0].content || 
+											   !geminiJson.candidates[0].content.parts || 
+											   geminiJson.candidates[0].content.parts.length === 0);
+						
+						if (isEmptyResponse && attempt < MAX_RETRIES) {
+							console.log(`Detected empty response (finishReason: OTHER), attempting retry #${attempt + 1} with a new key...`);
+							continue; // Continue to the next attempt
+						}
+						
 						// Use the object transformation function
-						const openaiJsonObject = transformGeminiResponseToOpenAIObject(geminiJson, requestedModelId!);
+						const openaiJsonObject = transformGeminiResponseToOpenAIObject(geminiJson, responseModelId);
 						return new Response(JSON.stringify(openaiJsonObject), { status: 200, headers: responseHeaders });
 					}
 					// --- ERROR: STREAM EXPECTED BUT NO BODY ---
@@ -1147,7 +1220,7 @@ async function handleAdminGeminiModels(request: Request, env: Env, ctx: Executio
   // Use the available key to request Gemini models list
   try {
     // Corrected URL and authentication method (using ?key= query parameter)
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${selectedKey.key}`;
+    const geminiUrl = `${GEMINI_BASE_URL}/v1beta/models?key=${selectedKey.key}`;
     const response = await fetch(geminiUrl, {
       method: 'GET',
       headers: {
@@ -1258,7 +1331,7 @@ async function handleTestGeminiKey(request: Request, env: Env, ctx: ExecutionCon
 			contents: [{ role: "user", parts: [{ text: "Hi" }] }],
 		};
 
-		const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${body.modelId}:generateContent?key=${apiKey}`;
+		const geminiUrl = `${GEMINI_BASE_URL}/v1beta/models/${body.modelId}:generateContent?key=${apiKey}`;
 
 		const response = await fetch(geminiUrl, {
 			method: 'POST',
@@ -2247,10 +2320,10 @@ async function getNextAvailableGeminiKey(env: Env, ctx: ExecutionContext, reques
 		}
 
 		// Save the next index for future requests
-		ctx.waitUntil(env.GEMINI_KEYS_KV.put(KV_KEY_GEMINI_KEY_INDEX, currentIndex.toString()));
+		ctx.waitUntil(kvSyncManager.setKV(env.GEMINI_KEYS_KV, KV_KEY_GEMINI_KEY_INDEX, currentIndex.toString()));
 		
 		// Save the selected key ID for potential exclusion in case of error handling
-		ctx.waitUntil(env.GEMINI_KEYS_KV.put(KV_KEY_LAST_USED_GEMINI_KEY_ID, selectedKeyId));
+		ctx.waitUntil(kvSyncManager.setKV(env.GEMINI_KEYS_KV, KV_KEY_LAST_USED_GEMINI_KEY_ID, selectedKeyId));
 		
 		console.log(`Selected Gemini Key ID via sequential round-robin: ${selectedKeyId} (next index: ${currentIndex})`);
 
@@ -2334,8 +2407,8 @@ async function incrementKeyUsage(keyId: string, env: Env, modelId?: string, cate
 			categoryUsage: categoryUsage,
 			consecutive429Counts: consecutive429Counts, // Save the (potentially reset) 429 counts
 		};
-		// Put the updated info back into KV
-		await env.GEMINI_KEYS_KV.put(keyKvName, JSON.stringify(updatedKeyInfo));
+		// 使用 kvSyncManager 将更新后的信息写入 KV
+		await kvSyncManager.setKV(env.GEMINI_KEYS_KV, keyKvName, JSON.stringify(updatedKeyInfo));
 		console.log(`Usage for key ${keyId} updated. Total: ${updatedKeyInfo.usage}, Date: ${updatedKeyInfo.usageDate}, Model: ${modelId} (${category}), Models: ${JSON.stringify(modelUsage)}, Categories: ${JSON.stringify(categoryUsage)}, 429Counts: ${JSON.stringify(consecutive429Counts)}`);
 
 	} catch (e) {
@@ -2457,26 +2530,43 @@ async function forceSetQuotaToLimit(keyId: string, env: Env, category: 'Pro' | '
 
 /**
  * Handles the logic when a 429 error is received from the Gemini API.
- * Increments the consecutive 429 counter for the specific model/category.
- * If the counter reaches 3 for quota-exceeded errors, triggers forceSetQuotaToLimit.
+ * For quota-exceeded errors, increments the consecutive 429 counter.
+ * If the counter reaches 3, triggers forceSetQuotaToLimit.
+ * For regular 429 errors, simply logs and returns (does not track counters).
  */
 async function handle429Error(keyId: string, env: Env, category: 'Pro' | 'Flash' | 'Custom', modelId?: string, errorMessage?: string): Promise<void> {
 	const keyKvName = `key:${keyId}`;
 	const CONSECUTIVE_429_LIMIT = 3;
-	const QUOTA_EXCEEDED_MESSAGE = "You exceeded your current quota, please check your plan and billing details.";
-	const isQuotaExceeded = errorMessage && errorMessage.includes(QUOTA_EXCEEDED_MESSAGE);
+	
+	// Determine if this is a quota exceeded error by checking for the specific identifier
+	// Newer method: Check for "PerDay" (case insensitive) in quotaId or error message
+	// Fallback method: Check for "quota" message
+	const isQuotaExceeded = errorMessage && 
+	    (errorMessage.toLowerCase().includes("perday") || 
+	     errorMessage.includes("You exceeded your current quota, please check your plan and billing details."));
+
+	// If it's a regular 429 (not quota exceeded), don't track counters, just log and return.
+	if (!isQuotaExceeded) {
+		console.log(`Received regular 429 for key ${keyId}. Ignoring counter, retry will be handled by caller if applicable.`);
+		return;
+	}
+
+	// --- Handle Quota Exceeded 429 ---
+	console.warn(`Received quota-exceeded 429 for key ${keyId}. Proceeding with counter logic.`);
 
 	try {
 		// Fetch current key info
 		const keyInfoJson = await env.GEMINI_KEYS_KV.get(keyKvName);
 		if (!keyInfoJson) {
-			console.warn(`Cannot handle 429: Key info not found for ID: ${keyId}`);
+			console.warn(`Cannot handle quota 429: Key info not found for ID: ${keyId}`);
 			return;
 		}
+		
 		let keyInfoData = JSON.parse(keyInfoJson) as Partial<Omit<GeminiKeyInfo, 'id'>>;
 		let consecutive429Counts = keyInfoData.consecutive429Counts || {};
 
 		// Determine the specific counter key (model ID or category string)
+		// Use keyId as prefix to ensure each key has its own independent counter
 		let counterKey: string | undefined = undefined;
 		let needsQuotaCheck = false; // Does this model/category have a quota defined?
 
@@ -2489,31 +2579,29 @@ async function handle429Error(keyId: string, env: Env, category: 'Pro' | 'Flash'
 		const categoryQuotas: CategoryQuotas = (categoryQuotasJson as CategoryQuotas) || { proQuota: Infinity, flashQuota: Infinity };
 		const modelConfig = modelId ? modelsConfig[modelId] : undefined;
 
-		// 为不同类型的429创建不同的计数器前缀
-		const counterPrefix = isQuotaExceeded ? "quota:" : "regular:";
-
 		if (category === 'Custom' && modelId) {
-			counterKey = counterPrefix + modelId;
-			needsQuotaCheck = isQuotaExceeded && !!modelConfig?.dailyQuota;
+			counterKey = `${keyId}-${modelId}`; // Prefix with keyId for uniqueness
+			needsQuotaCheck = !!modelConfig?.dailyQuota;
 		} else if ((category === 'Pro' || category === 'Flash') && modelId && modelConfig?.individualQuota) {
 			// Pro/Flash model *with* individual quota -> use model ID as key
-			counterKey = counterPrefix + modelId;
-			needsQuotaCheck = isQuotaExceeded && true; // Individual quota exists
+			counterKey = `${keyId}-${modelId}`; // Prefix with keyId for uniqueness
+			needsQuotaCheck = true; // Individual quota exists
 		} else if (category === 'Pro') {
 			// Pro model *without* individual quota -> use category key
-			counterKey = counterPrefix + 'category:pro';
-			needsQuotaCheck = isQuotaExceeded && !!categoryQuotas?.proQuota && isFinite(categoryQuotas.proQuota);
+			counterKey = `${keyId}-category:pro`; // Prefix with keyId for uniqueness
+			needsQuotaCheck = !!categoryQuotas?.proQuota && isFinite(categoryQuotas.proQuota);
 		} else if (category === 'Flash') {
 			// Flash model *without* individual quota -> use category key
-			counterKey = counterPrefix + 'category:flash';
-			needsQuotaCheck = isQuotaExceeded && !!categoryQuotas?.flashQuota && isFinite(categoryQuotas.flashQuota);
+			counterKey = `${keyId}-category:flash`; // Prefix with keyId for uniqueness
+			needsQuotaCheck = !!categoryQuotas?.flashQuota && isFinite(categoryQuotas.flashQuota);
 		}
 
 		if (!counterKey) {
-			console.warn(`Could not determine counter key for key ${keyId}, category ${category}, model ${modelId}. Skipping 429 handling.`);
+			console.warn(`Could not determine counter key for quota 429 handling (key ${keyId}, category ${category}, model ${modelId}).`);
 			return;
 		}
-		if (!needsQuotaCheck && isQuotaExceeded) {
+		
+		if (!needsQuotaCheck) {
 			console.log(`Skipping quota-exceeded 429 counter for key ${keyId}, counter ${counterKey} as no relevant quota is configured.`);
 			return; // Don't count 429s if there's no quota to hit anyway
 		}
@@ -2522,33 +2610,25 @@ async function handle429Error(keyId: string, env: Env, category: 'Pro' | 'Flash'
 		const currentCount = (consecutive429Counts[counterKey] || 0) + 1;
 		consecutive429Counts[counterKey] = currentCount;
 
-		if (isQuotaExceeded) {
-			console.warn(`Received quota-exceeded 429 for key ${keyId}, counter ${counterKey}. Consecutive count: ${currentCount}`);
-		} else {
-			console.warn(`Received regular 429 for key ${keyId}, counter ${counterKey}. Consecutive count: ${currentCount}`);
-		}
+		console.warn(`Quota-exceeded 429 for key ${keyId}, counter ${counterKey}. Consecutive count: ${currentCount}`);
 
-		// The quota limit is enforced only when 429 errors of the quota-exhausted type consecutively reach the threshold
-		if (isQuotaExceeded && currentCount >= CONSECUTIVE_429_LIMIT) {
+		// Check if the threshold is reached
+		if (currentCount >= CONSECUTIVE_429_LIMIT) {
 			console.warn(`Consecutive quota-exceeded 429 limit (${CONSECUTIVE_429_LIMIT}) reached for key ${keyId}, counter ${counterKey}. Forcing quota limit.`);
 			// Call forceSetQuotaToLimit, passing the counterKey to reset it
 			await forceSetQuotaToLimit(keyId, env, category, modelId, counterKey);
-			// Note: forceSetQuotaToLimit now handles resetting the specific counter
+			// Note: forceSetQuotaToLimit handles resetting the specific counter
 		} else {
-			// Limit not reached or not a quota-exceeded 429, just save the updated counts
+			// Limit not reached, just save the updated counts
 			const updatedKeyInfo: Partial<Omit<GeminiKeyInfo, 'id'>> = {
 				...keyInfoData,
 				consecutive429Counts: consecutive429Counts,
 			};
 			await env.GEMINI_KEYS_KV.put(keyKvName, JSON.stringify(updatedKeyInfo));
-			
-			if (!isQuotaExceeded) {
-				console.log(`Regular 429 received, only tracking count without forcing quota limit.`);
-			}
 		}
 
 	} catch (e) {
-		console.error(`Failed to handle 429 error for key ${keyId}:`, e);
+		console.error(`Failed to handle quota 429 error for key ${keyId}:`, e);
 	}
 }
 
@@ -2570,8 +2650,8 @@ async function recordKeyError(keyId: string, env: Env, status: 401 | 403): Promi
 		// Update the error status
 		keyInfoData.errorStatus = status;
 
-		// Put the updated info back into KV
-		await env.GEMINI_KEYS_KV.put(keyKvName, JSON.stringify(keyInfoData));
+		// 使用 kvSyncManager 将错误状态写入 KV
+		await kvSyncManager.setKV(env.GEMINI_KEYS_KV, keyKvName, JSON.stringify(keyInfoData));
 		console.log(`Recorded error status ${status} for key ${keyId}.`);
 
 	} catch (e) {

@@ -34,7 +34,14 @@
      * `GITHUB_ENCRYPT_KEY`: 设置一个用于加密同步数据的密钥，**必须是 32 位或更长的字符串**。\
      ![](image/4.3.jpg)
      * (可选)`KEEPALIVE`: 填入`1`启用心跳机制，以实现假流式传输。\
+     详情参考: [KEEPALIVE模式介绍](../../Usage/KEEPALIVE.md)\
      ![](image/4.6.jpg)
+     * (可选)`CF_GATEWAY`: 填入`1`启用脚本默认提供的Cloudflare AI Gateway网关转发请求，或输入您自己网关链接。\
+     详情参考: [CF_GATEWAY介绍](../../Usage/CF_GATEWAY.md)\
+     ![](image/4.7.jpg)
+     * (可选)`VERTEX`: 填入JSON格式的服务账号API密钥可以启用Vertex代理功能。\
+     详情参考: [Vertex代理配置](../../Usage/Vertex/Vertex代理配置.md)\
+     ![](image/4.8.jpg)
      * Secrets配置完成。\
      ![](image/5.0.jpg)
 
@@ -57,4 +64,5 @@
    ![](image/7.jpg)
 
 6. **在后台中进行设置**
-   在后台UI中进行配置 Api 连接，详细请参考[配置API连接教程](../../Usage/配置API连接.md)
+   
+   * 在后台UI中进行配置 Api 连接，详细请参考[配置API连接教程](../../Usage/配置API连接.md)
