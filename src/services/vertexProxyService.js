@@ -13,13 +13,14 @@ const transformUtils = require('../utils/transform');
 const VERTEX_SUPPORTED_MODELS = [
     "[v]gemini-2.5-pro-exp-03-25",
     "[v]gemini-2.5-pro-preview-05-06",
+    "[v]gemini-2.5-pro-preview-06-05",
     "[v]gemini-2.0-flash-001",
     "[v]gemini-2.5-flash-preview-04-17",
     "[v]gemini-2.5-flash-preview-05-20"
 ];
 
 // Default region
-const DEFAULT_REGION = 'us-central1';
+const DEFAULT_REGION = 'global';
 
 // Temporary credentials file path
 let tempCredentialsPath = null;
@@ -598,9 +599,6 @@ async function proxyVertexChatCompletions(openAIRequestBody, workerApiKey, strea
 
             // Initialize GoogleGenAI client with Vertex AI service account configuration
             let region = DEFAULT_REGION;
-            if (requestedModelId === '[v]gemini-2.5-pro-exp-03-25') {
-                region = 'global';
-            }
             ai = new GoogleGenAI({
                 vertexai: true,
                 project: project_id,
